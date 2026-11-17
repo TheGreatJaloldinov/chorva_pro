@@ -1,53 +1,260 @@
-import asyncio, logging, json
+import asyncio
+import html
+import json
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
-from sqlalchemy import select
 from aiogram.types import FSInputFile
+from sqlalchemy import select
+
 from app.config import BOT_TOKEN, TIMEZONE
-from app.db import init_db, Session, User, Animal, FeedingSchedule, FeedingReminder, BackupLog
+from app.db import (
+    init_db, Session, User, Animal, FeedingSchedule, FeedingReminder, BackupLog,
+    FeedType, FeedLot, FeedUsage, Expense, Income,
+    NotificationLog, StockAlertState, DailyReportLog,
+)
 from app.handlers import router
 from app.keyboards import reminder_kb
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-log=logging.getLogger("chorva_pro")
+log = logging.getLogger("chorva_pro")
+
+
+def format_feed_quantity(quantity_kg: float) -> str:
+    """Render kg values in a human-friendly kg/gram format."""
+    grams = max(0, int(round(float(quantity_kg or 0) * 1000)))
+    kg, remainder = divmod(grams, 1000)
+    if kg and remainder:
+        return f"{kg} kg {remainder} gr"
+    if kg:
+        return f"{kg} kg"
+    return f"{remainder} gr"
+
 
 async def reminder_worker(bot: Bot):
-    tz=ZoneInfo(TIMEZONE)
+    """Per-user feeding reminders, low-stock alerts and optional daily summaries."""
     while True:
         try:
-            now=datetime.now(tz)
-            clock=now.strftime("%H:%M")
-            day=now.strftime("%Y-%m-%d")
             async with Session() as s:
-                schedules=(await s.execute(select(FeedingSchedule).where(FeedingSchedule.active==True))).scalars().all()
+                schedules = (await s.execute(
+                    select(FeedingSchedule).where(FeedingSchedule.active.is_(True))
+                )).scalars().all()
+
                 for sch in schedules:
-                    try: times=json.loads(sch.times_json)
-                    except Exception: continue
-                    if clock not in times: continue
-                    stamp=f"{day} {clock} schedule:{sch.id}"
-                    existing=(await s.execute(select(FeedingReminder).where(FeedingReminder.scheduled_for==stamp))).scalar_one_or_none()
-                    if existing: continue
-                    animal=(await s.execute(select(Animal).where(Animal.id==sch.animal_id,Animal.user_id==sch.user_id,Animal.status=="active"))).scalar_one_or_none()
-                    user=await s.get(User,sch.user_id)
-                    if not animal or not user: continue
-                    reminder=FeedingReminder(user_id=sch.user_id,schedule_id=sch.id,animal_id=animal.id,scheduled_for=stamp,items_json=sch.items_json,status="pending")
-                    s.add(reminder)
                     try:
-                        await s.commit(); await s.refresh(reminder)
+                        times = json.loads(sch.times_json)
+                        items = json.loads(sch.items_json)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        log.warning("Invalid feeding schedule JSON: %s", sch.id)
+                        continue
+
+                    user = await s.get(User, sch.user_id)
+                    animal = await s.get(Animal, sch.animal_id)
+                    if not user or not animal or animal.status != "active":
+                        continue
+
+                    try:
+                        user_tz = ZoneInfo(user.timezone or TIMEZONE)
                     except Exception:
-                        await s.rollback(); continue
-                    items=json.loads(sch.items_json)
-                    lines=[]
-                    for item in items:
-                        if item.get("water") or item["name"].lower()=="suv": lines.append("💧 Suv")
-                        else: lines.append(f"• {item['qty']:g} kg {item['name']}")
-                    text=(f"⏰ <b>Ozuqa berish vaqti!</b>\n\n🐂 ID: <b>{animal.code}</b> · {animal.kind}\n\n"+"\n".join(lines)+"\n\nBerilgan miqdorni tasdiqlang:")
-                    try: await bot.send_message(user.telegram_id,text,reply_markup=reminder_kb(reminder.id),parse_mode="HTML")
-                    except Exception as e: log.warning("Reminder send failed for user %s: %s",user.telegram_id,e)
+                        user_tz = ZoneInfo(TIMEZONE)
+                    now = datetime.now(user_tz).replace(second=0, microsecond=0)
+                    day = now.strftime("%Y-%m-%d")
+                    lead_minutes = max(0, int(user.reminder_minutes or 0))
+
+                    for clock in times:
+                        try:
+                            hour, minute = map(int, str(clock).split(":"))
+                            target = now.replace(hour=hour, minute=minute)
+                        except (TypeError, ValueError):
+                            continue
+
+                        delta = int((target - now).total_seconds() // 60)
+                        if delta != 0 and (lead_minutes == 0 or delta != lead_minutes):
+                            continue
+
+                        kind = "due" if delta == 0 else f"pre{lead_minutes}"
+                        lines = []
+                        for item in items:
+                            item_name = str(item.get("name", "Yem"))
+                            if item.get("water") or item_name.strip().lower() == "suv":
+                                lines.append("💧 Suv")
+                            else:
+                                qty = item.get("qty", item.get("quantity", 0))
+                                lines.append(f"• {format_feed_quantity(float(qty or 0))} {html.escape(item_name)}")
+
+                        if kind == "due":
+                            stamp = f"{day} {clock} schedule:{sch.id}"
+                            reminder = (await s.execute(
+                                select(FeedingReminder).where(FeedingReminder.scheduled_for == stamp)
+                            )).scalar_one_or_none()
+                            if reminder:
+                                continue
+                            reminder = FeedingReminder(
+                                user_id=sch.user_id,
+                                schedule_id=sch.id,
+                                animal_id=animal.id,
+                                scheduled_for=stamp,
+                                items_json=sch.items_json,
+                                status="pending",
+                            )
+                            s.add(reminder)
+                            try:
+                                await s.commit()
+                                await s.refresh(reminder)
+                            except Exception:
+                                await s.rollback()
+                                continue
+                            msg = (
+                                f"⏰ <b>Ozuqa berish vaqti keldi!</b>\n\n"
+                                f"🐂 ID: <b>{html.escape(animal.code)}</b> · {html.escape(animal.kind)}\n"
+                                f"⏰ Vaqt: <b>{html.escape(str(clock))}</b>\n\n"
+                                + "\n".join(lines)
+                                + "\n\nBerilganini CHORVA PRO’da tasdiqlang."
+                            )
+                            try:
+                                await bot.send_message(
+                                    user.telegram_id, msg, parse_mode="HTML",
+                                    reply_markup=reminder_kb(reminder.id),
+                                )
+                            except Exception as exc:
+                                log.warning("Due reminder send failed for %s: %s", user.telegram_id, exc)
+                                # Remove the unsent pending reminder so the worker can retry.
+                                try:
+                                    await s.delete(reminder)
+                                    await s.commit()
+                                except Exception:
+                                    await s.rollback()
+                        else:
+                            event_key = f"feeding:{user.id}:{sch.id}:{day}:{clock}:{kind}"
+                            exists = (await s.execute(
+                                select(NotificationLog.id).where(NotificationLog.event_key == event_key)
+                            )).scalar_one_or_none()
+                            if exists:
+                                continue
+                            msg = (
+                                f"🔔 <b>Ozuqa vaqti yaqin!</b>\n\n"
+                                f"🐂 ID: <b>{html.escape(animal.code)}</b> · {html.escape(animal.kind)}\n"
+                                f"⏰ Belgilangan vaqt: <b>{html.escape(str(clock))}</b> ({lead_minutes} daqiqadan keyin)\n\n"
+                                + "\n".join(lines)
+                            )
+                            try:
+                                await bot.send_message(user.telegram_id, msg, parse_mode="HTML")
+                                s.add(NotificationLog(user_id=user.id, event_key=event_key))
+                                await s.commit()
+                            except Exception as exc:
+                                await s.rollback()
+                                log.warning("Pre-feeding alert failed for %s: %s", user.telegram_id, exc)
+
+                # Low-stock alerts: one message per low-stock episode. A new alert is
+                # enabled only after stock rises above the threshold and falls again.
+                feeds = (await s.execute(select(FeedType))).scalars().all()
+                for feed in feeds:
+                    lots = (await s.execute(
+                        select(FeedLot).where(
+                            FeedLot.user_id == feed.user_id,
+                            FeedLot.feed_type_id == feed.id,
+                        )
+                    )).scalars().all()
+                    remaining = sum(float(lot.quantity_remaining or 0) for lot in lots)
+                    threshold = float(feed.low_stock_alert if feed.low_stock_alert is not None else 5)
+                    state = (await s.execute(
+                        select(StockAlertState).where(
+                            StockAlertState.user_id == feed.user_id,
+                            StockAlertState.feed_type_id == feed.id,
+                        )
+                    )).scalar_one_or_none()
+
+                    if remaining > threshold:
+                        if state and state.is_low:
+                            state.is_low = False
+                            await s.commit()
+                        continue
+                    if state and state.is_low:
+                        continue
+
+                    user = await s.get(User, feed.user_id)
+                    if not user:
+                        continue
+                    msg = (
+                        "⚠️ <b>OMBOR OGOHLANTIRISHI</b>\n\n"
+                        f"🌾 {html.escape(feed.name)}: <b>{format_feed_quantity(remaining)}</b> qoldi.\n"
+                        f"📉 Ogohlantirish chegarasi: {format_feed_quantity(threshold)}.\n\n"
+                        "Ozuqa zaxirasini to‘ldirish tavsiya etiladi."
+                    )
+                    try:
+                        await bot.send_message(user.telegram_id, msg, parse_mode="HTML")
+                        if state is None:
+                            s.add(StockAlertState(user_id=feed.user_id, feed_type_id=feed.id, is_low=True))
+                        else:
+                            state.is_low = True
+                        await s.commit()
+                    except Exception as exc:
+                        await s.rollback()
+                        log.warning("Low-stock alert failed for %s: %s", user.telegram_id, exc)
+
+                # Optional daily report at 20:00 in each user's configured timezone.
+                users = (await s.execute(select(User).where(User.daily_report_enabled.is_(True)))).scalars().all()
+                for user in users:
+                    try:
+                        user_tz = ZoneInfo(user.timezone or TIMEZONE)
+                    except Exception:
+                        user_tz = ZoneInfo(TIMEZONE)
+                    now = datetime.now(user_tz)
+                    if now.strftime("%H:%M") != "20:00":
+                        continue
+                    day = now.strftime("%Y-%m-%d")
+                    already_sent = (await s.execute(
+                        select(DailyReportLog.id).where(
+                            DailyReportLog.user_id == user.id,
+                            DailyReportLog.report_date == day,
+                        )
+                    )).scalar_one_or_none()
+                    if already_sent:
+                        continue
+
+                    feed_usage = (await s.execute(select(FeedUsage).where(
+                        FeedUsage.user_id == user.id, FeedUsage.used_at == day
+                    ))).scalars().all()
+                    expenses = (await s.execute(select(Expense).where(
+                        Expense.user_id == user.id, Expense.expense_date == day
+                    ))).scalars().all()
+                    incomes = (await s.execute(select(Income).where(
+                        Income.user_id == user.id, Income.income_date == day
+                    ))).scalars().all()
+                    animal_count = (await s.execute(select(Animal).where(
+                        Animal.user_id == user.id, Animal.status == "active"
+                    ))).scalars().all()
+                    feed_names = {}
+                    for usage in feed_usage:
+                        feed = await s.get(FeedType, usage.feed_type_id)
+                        feed_name = feed.name if feed else "Yem"
+                        feed_names[feed_name] = feed_names.get(feed_name, 0.0) + float(usage.quantity or 0)
+                    feed_lines = [f"• {html.escape(name)}: {format_feed_quantity(qty)}" for name, qty in sorted(feed_names.items())]
+                    income_total = sum(float(x.amount or 0) for x in incomes)
+                    expense_total = sum(float(x.amount or 0) for x in expenses)
+                    report = (
+                        f"📊 <b>CHORVA PRO · Kunlik hisobot</b>\n\n"
+                        f"📅 Sana: <b>{day}</b>\n"
+                        f"🐄 Faol chorva: <b>{len(animal_count)} bosh</b>\n"
+                        f"🌾 Yem sarfi: <b>{format_feed_quantity(sum(feed_names.values()))}</b>\n"
+                        f"📈 Daromad: <b>{income_total:,.0f} so‘m</b>\n"
+                        f"📉 Xarajat: <b>{expense_total:,.0f} so‘m</b>\n"
+                        f"💰 Sof natija: <b>{income_total-expense_total:,.0f} so‘m</b>"
+                    )
+                    if feed_lines:
+                        report += "\n\n<b>Yemlar bo‘yicha:</b>\n" + "\n".join(feed_lines)
+                    try:
+                        await bot.send_message(user.telegram_id, report, parse_mode="HTML")
+                        s.add(DailyReportLog(user_id=user.id, report_date=day))
+                        await s.commit()
+                    except Exception as exc:
+                        await s.rollback()
+                        log.warning("Daily report send failed for %s: %s", user.telegram_id, exc)
         except Exception:
-            log.exception("Reminder worker error")
+            log.exception("Reminder/stock notification worker error")
         await asyncio.sleep(20)
 
 

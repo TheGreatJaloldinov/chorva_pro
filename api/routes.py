@@ -17,9 +17,40 @@ def animal_dict(a):
     return {"id":a.id,"code":a.code,"kind":a.kind,"breed":a.breed,"sex":a.sex,"age_months":a.age_months,"current_weight":a.current_weight,"purchase_date":a.purchase_date,"purchase_price":a.purchase_price,"note":a.note,"status":a.status,"photo_file_id":a.photo_file_id}
 
 @router.get('/health')
-async def health(): return {"ok":True,"app":"CHORVA PRO","version":"2.0"}
+async def health(): return {"ok":True,"app":"CHORVA PRO","version":"2.4.1"}
 @router.get('/me')
-async def me(user:User=Depends(current_user)): return {"telegram_id":user.telegram_id,"full_name":user.full_name}
+async def me(user:User=Depends(current_user)):
+    return {"telegram_id":user.telegram_id,"full_name":user.full_name}
+
+@router.get('/profile')
+async def get_profile(user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
+    animal_count=(await session.execute(select(func.count(Animal.id)).where(Animal.user_id==user.id,Animal.status=='active'))).scalar_one()
+    feed_count=(await session.execute(select(func.count(FeedType.id)).where(FeedType.user_id==user.id))).scalar_one()
+    return {"full_name":user.full_name,"phone":user.phone,"farm_name":user.farm_name,"farm_address":user.farm_address,"farm_type":user.farm_type,"language":user.language,"timezone":user.timezone,"reminder_minutes":user.reminder_minutes,"daily_report_enabled":user.daily_report_enabled,"low_stock_default":user.low_stock_default,"telegram_id":user.telegram_id,"created_at":user.created_at.isoformat() if user.created_at else None,"animal_count":animal_count,"feed_count":feed_count}
+
+@router.patch('/profile')
+async def update_profile(payload:dict,user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
+    allowed={'full_name':200,'phone':40,'farm_name':200,'farm_address':300,'farm_type':80,'language':10,'timezone':50}
+    for key,max_len in allowed.items():
+        if key in payload:
+            value=str(payload[key] or '').strip()
+            if len(value)>max_len: raise HTTPException(422,f'{key} juda uzun')
+            setattr(user,key,value)
+    if 'reminder_minutes' in payload:
+        value=int(payload['reminder_minutes'])
+        if value not in (0,5,10,15,30,60): raise HTTPException(422,'Eslatma vaqti noto‘g‘ri')
+        user.reminder_minutes=value
+    if 'daily_report_enabled' in payload: user.daily_report_enabled=bool(payload['daily_report_enabled'])
+    if 'low_stock_default' in payload:
+        value=float(payload['low_stock_default'])
+        if value<0 or value>1000000: raise HTTPException(422,'Ombor chegarasi noto‘g‘ri')
+        user.low_stock_default=value
+        # The profile setting is the farm-wide default: apply it to existing feed types too.
+        feed_types=(await session.execute(select(FeedType).where(FeedType.user_id==user.id))).scalars().all()
+        for feed in feed_types:
+            feed.low_stock_alert=value
+    await session.commit()
+    return {'ok':True}
 
 @router.get('/dashboard')
 async def dashboard(user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
@@ -113,7 +144,7 @@ async def list_feeds(user:User=Depends(current_user),session:AsyncSession=Depend
 @router.post('/feeds/purchases')
 async def add_feed_purchase(payload:FeedPurchaseCreate,user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
     f=(await session.execute(select(FeedType).where(FeedType.user_id==user.id,func.lower(FeedType.name)==payload.name.strip().lower()))).scalar_one_or_none()
-    if not f: f=FeedType(user_id=user.id,name=payload.name.strip()); session.add(f); await session.flush()
+    if not f: f=FeedType(user_id=user.id,name=payload.name.strip(),low_stock_alert=float(user.low_stock_default or 5)); session.add(f); await session.flush()
     session.add(FeedLot(user_id=user.id,feed_type_id=f.id,purchased_at=payload.purchased_at,quantity_initial=payload.quantity,quantity_remaining=payload.quantity,unit_price=payload.unit_price,supplier=payload.supplier))
     session.add(Expense(user_id=user.id,category='Yem-xashak xaridi',amount=payload.quantity*payload.unit_price,expense_date=payload.purchased_at,description=f'{f.name} {payload.quantity:g} kg xarid'))
     await session.commit(); return {'ok':True,'feed':f.name}

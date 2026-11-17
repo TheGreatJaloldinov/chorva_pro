@@ -14,9 +14,9 @@ async def lifespan(app):
     await init_db()
     yield
 
-app = FastAPI(title="CHORVA PRO API", version="2.0", description="CHORVA PRO Web App va Telegram Mini App backend", lifespan=lifespan)
+app = FastAPI(title="CHORVA PRO API", version="2.4.1", description="CHORVA PRO Web App va Telegram Mini App backend", lifespan=lifespan)
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",") if x.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=False, allow_methods=["GET", "POST", "PATCH", "OPTIONS"], allow_headers=["Content-Type", "X-Telegram-Init-Data", "X-Dev-Telegram-Id"])
+app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=False, allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"], allow_headers=["Content-Type", "X-Telegram-Init-Data", "X-Dev-Telegram-Id"])
 app.include_router(router)
 
 DIST = Path(__file__).resolve().parent.parent / "webapp" / "dist"

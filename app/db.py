@@ -12,6 +12,15 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     full_name: Mapped[str] = mapped_column(String(200), default="")
+    phone: Mapped[str] = mapped_column(String(40), default="")
+    farm_name: Mapped[str] = mapped_column(String(200), default="")
+    farm_address: Mapped[str] = mapped_column(String(300), default="")
+    farm_type: Mapped[str] = mapped_column(String(80), default="Chorvachilik")
+    language: Mapped[str] = mapped_column(String(10), default="uz")
+    timezone: Mapped[str] = mapped_column(String(50), default="Asia/Tashkent")
+    reminder_minutes: Mapped[int] = mapped_column(Integer, default=15)
+    daily_report_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    low_stock_default: Mapped[float] = mapped_column(Float, default=5)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 class Animal(Base):
@@ -46,7 +55,7 @@ class FeedType(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     name: Mapped[str] = mapped_column(String(100))
-    low_stock_alert: Mapped[float] = mapped_column(Float, default=10)
+    low_stock_alert: Mapped[float] = mapped_column(Float, default=5)
     __table_args__ = (UniqueConstraint("user_id", "name", name="uq_feed_user_name"),)
 
 class FeedLot(Base):
@@ -117,9 +126,23 @@ async def init_db():
         # Telegram user IDs can exceed PostgreSQL INTEGER (int32). Upgrade
         # existing installations in-place without deleting user data.
         if engine.dialect.name == "postgresql":
-            await conn.execute(text(
-                "ALTER TABLE users ALTER COLUMN telegram_id TYPE BIGINT"
-            ))
+            await conn.execute(text("ALTER TABLE users ALTER COLUMN telegram_id TYPE BIGINT"))
+            # Add profile fields in-place; existing farm data is preserved.
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(40) NOT NULL DEFAULT ''"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS farm_name VARCHAR(200) NOT NULL DEFAULT ''"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS farm_address VARCHAR(300) NOT NULL DEFAULT ''"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS farm_type VARCHAR(80) NOT NULL DEFAULT 'Chorvachilik'"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS language VARCHAR(10) NOT NULL DEFAULT 'uz'"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone VARCHAR(50) NOT NULL DEFAULT 'Asia/Tashkent'"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS reminder_minutes INTEGER NOT NULL DEFAULT 15"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_report_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS low_stock_default FLOAT NOT NULL DEFAULT 5"))
+            # v2.3 notification tables are created by metadata.create_all above.
+            # Keep the default alert threshold aligned with the selected 5 kg setting.
+            await conn.execute(text("ALTER TABLE feed_types ALTER COLUMN low_stock_alert SET DEFAULT 5"))
+            await conn.execute(text("UPDATE feed_types SET low_stock_alert = 5 WHERE low_stock_alert IS NULL OR low_stock_alert = 10"))
+        else:
+            await conn.execute(text("UPDATE feed_types SET low_stock_alert = 5 WHERE low_stock_alert IS NULL OR low_stock_alert = 10"))
 
 async def get_user(session: AsyncSession, telegram_id: int, full_name: str = "") -> User:
     result = await session.execute(select(User).where(User.telegram_id == telegram_id))
@@ -137,6 +160,32 @@ class BackupLog(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     backup_date: Mapped[str] = mapped_column(String(20))
     __table_args__ = (UniqueConstraint("user_id", "backup_date", name="uq_backup_user_date"),)
+
+
+class NotificationLog(Base):
+    __tablename__ = "notification_logs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    event_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    sent_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class StockAlertState(Base):
+    __tablename__ = "stock_alert_states"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    feed_type_id: Mapped[int] = mapped_column(ForeignKey("feed_types.id"), index=True)
+    is_low: Mapped[bool] = mapped_column(Boolean, default=False)
+    __table_args__ = (UniqueConstraint("user_id", "feed_type_id", name="uq_stock_alert_user_feed"),)
+
+
+class DailyReportLog(Base):
+    __tablename__ = "daily_report_logs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    report_date: Mapped[str] = mapped_column(String(20))
+    sent_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("user_id", "report_date", name="uq_daily_report_user_date"),)
 
 
 class FeedUsage(Base):
