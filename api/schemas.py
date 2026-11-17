@@ -11,6 +11,10 @@ class AnimalCreate(BaseModel):
     note: str = ""
 
 class AnimalUpdate(BaseModel):
+    code: str | None = Field(default=None, max_length=40)
+    kind: str | None = None
+    purchase_date: str | None = None
+    purchase_price: float | None = Field(default=None, ge=0)
     breed: str | None = None
     age_months: int | None = Field(default=None, ge=0, le=1200)
     current_weight: float | None = Field(default=None, ge=0)

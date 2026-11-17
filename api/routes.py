@@ -66,10 +66,25 @@ async def animal_detail(aid:int,user:User=Depends(current_user),session:AsyncSes
 async def update_animal(aid:int,payload:AnimalUpdate,user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
     a=(await session.execute(select(Animal).where(Animal.id==aid,Animal.user_id==user.id))).scalar_one_or_none()
     if not a: raise HTTPException(404,'Chorva topilmadi')
-    for k,v in payload.model_dump(exclude_unset=True).items():
-        if k=='status' and v not in ['active','archived']: raise HTTPException(422,'Holat noto‘g‘ri')
-        setattr(a,k,v)
+    updates=payload.model_dump(exclude_unset=True)
+    if 'status' in updates and updates['status'] not in ['active','archived']: raise HTTPException(422,'Holat noto‘g‘ri')
+    if 'kind' in updates and updates['kind'] not in ['Sigir','Buqa','Qo‘chqor','Sovliq']: raise HTTPException(422,'Chorva turi noto‘g‘ri')
+    if 'code' in updates and updates['code']:
+        duplicate=(await session.execute(select(Animal.id).where(Animal.user_id==user.id,Animal.code==updates['code'],Animal.id!=aid))).scalar_one_or_none()
+        if duplicate: raise HTTPException(409,'Bu ID raqami band')
+    sexmap={'Sigir':'Urg‘ochi','Buqa':'Erkak','Qo‘chqor':'Erkak','Sovliq':'Urg‘ochi'}
+    for k,v in updates.items(): setattr(a,k,v)
+    if 'kind' in updates: a.sex=sexmap[updates['kind']]
     await session.commit(); return {'ok':True}
+
+@router.delete('/animals/{aid}')
+async def delete_animal(aid:int,user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
+    a=(await session.execute(select(Animal).where(Animal.id==aid,Animal.user_id==user.id))).scalar_one_or_none()
+    if not a: raise HTTPException(404,'Chorva topilmadi')
+    # Preserve financial and operational history by archiving instead of hard deletion.
+    a.status='archived'
+    await session.commit()
+    return {'ok':True,'archived':True}
 
 @router.post('/animals/{aid}/weights')
 async def add_weight(aid:int,payload:WeightCreate,user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
@@ -124,6 +139,47 @@ async def usage_history(user:User=Depends(current_user),session:AsyncSession=Dep
     rows=(await session.execute(select(FeedUsage).where(FeedUsage.user_id==user.id).order_by(FeedUsage.used_at.desc()).limit(100))).scalars().all()
     return [{'id':x.id,'feed_id':x.feed_type_id,'animal_id':x.animal_id,'quantity':x.quantity,'date':x.used_at,'note':x.note} for x in rows]
 
+@router.post('/feeds/{fid}/adjust')
+async def adjust_feed_stock(fid:int,payload:dict,user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
+    f=(await session.execute(select(FeedType).where(FeedType.id==fid,FeedType.user_id==user.id))).scalar_one_or_none()
+    if not f: raise HTTPException(404,'Yem topilmadi')
+    qty=float(payload.get('quantity',0)); direction=str(payload.get('direction','add'))
+    if qty<=0: raise HTTPException(422,'Miqdor musbat bo‘lishi kerak')
+    if direction=='add':
+        session.add(FeedLot(user_id=user.id,feed_type_id=f.id,purchased_at=date.today().isoformat(),quantity_initial=qty,quantity_remaining=qty,unit_price=0,supplier='Qo‘lda tuzatish'))
+    elif direction=='subtract':
+        lots=(await session.execute(select(FeedLot).where(FeedLot.user_id==user.id,FeedLot.feed_type_id==fid,FeedLot.quantity_remaining>0).order_by(FeedLot.purchased_at,FeedLot.id))).scalars().all()
+        available=sum(x.quantity_remaining for x in lots)
+        if available+1e-8<qty: raise HTTPException(409,f'Omborda faqat {available:g} kg bor')
+        left=qty
+        for lot in lots:
+            take=min(left,lot.quantity_remaining); lot.quantity_remaining-=take; left-=take
+            if left<=1e-8: break
+        session.add(FeedUsage(user_id=user.id,feed_type_id=f.id,quantity=qty,used_at=date.today().isoformat(),note='Ombor qoldig‘ini qo‘lda kamaytirish'))
+    else: raise HTTPException(422,'Amal noto‘g‘ri')
+    await session.commit(); return {'ok':True}
+
+@router.patch('/feeds/{fid}')
+async def rename_feed(fid:int,payload:dict,user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
+    f=(await session.execute(select(FeedType).where(FeedType.id==fid,FeedType.user_id==user.id))).scalar_one_or_none()
+    if not f: raise HTTPException(404,'Yem topilmadi')
+    name=str(payload.get('name',f.name)).strip()
+    if not name: raise HTTPException(422,'Yem nomini kiriting')
+    duplicate=(await session.execute(select(FeedType).where(FeedType.user_id==user.id,func.lower(FeedType.name)==name.lower(),FeedType.id!=fid))).scalar_one_or_none()
+    if duplicate: raise HTTPException(409,'Bu nomdagi yem mavjud')
+    f.name=name
+    await session.commit(); return {'ok':True}
+
+@router.delete('/feeds/{fid}')
+async def delete_feed(fid:int,user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
+    f=(await session.execute(select(FeedType).where(FeedType.id==fid,FeedType.user_id==user.id))).scalar_one_or_none()
+    if not f: raise HTTPException(404,'Yem topilmadi')
+    used=(await session.execute(select(FeedUsage.id).where(FeedUsage.user_id==user.id,FeedUsage.feed_type_id==fid).limit(1))).scalar_one_or_none()
+    if used: raise HTTPException(409,'Bu yemda sarf tarixi bor. Tarixni saqlash uchun o‘chirish mumkin emas, nomini tahrirlang.')
+    lots=(await session.execute(select(FeedLot).where(FeedLot.user_id==user.id,FeedLot.feed_type_id==fid))).scalars().all()
+    for lot in lots: await session.delete(lot)
+    await session.delete(f); await session.commit(); return {'ok':True}
+
 @router.post('/feeds/{fid}/alert')
 async def set_feed_alert(fid:int,payload:dict,user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
     f=(await session.execute(select(FeedType).where(FeedType.id==fid,FeedType.user_id==user.id))).scalar_one_or_none()
@@ -157,9 +213,19 @@ async def update_schedule(sid:int,payload:dict,user:User=Depends(current_user),s
     row=(await session.execute(select(FeedingSchedule).where(FeedingSchedule.id==sid,FeedingSchedule.user_id==user.id))).scalar_one_or_none()
     if not row: raise HTTPException(404,'Jadval topilmadi')
     if 'active' in payload: row.active=bool(payload['active'])
+    if 'animal_id' in payload:
+        animal=(await session.execute(select(Animal).where(Animal.id==int(payload['animal_id']),Animal.user_id==user.id,Animal.status=='active'))).scalar_one_or_none()
+        if not animal: raise HTTPException(404,'Faol chorva topilmadi')
+        row.animal_id=animal.id
     if 'times' in payload: row.times_json=json.dumps(payload['times'],ensure_ascii=False)
     if 'items' in payload: row.items_json=json.dumps([{**x,'qty':float(x.get('quantity',x.get('qty',0)))} for x in payload['items']],ensure_ascii=False)
     await session.commit(); return {'ok':True}
+
+@router.delete('/schedules/{sid}')
+async def delete_schedule(sid:int,user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
+    row=(await session.execute(select(FeedingSchedule).where(FeedingSchedule.id==sid,FeedingSchedule.user_id==user.id))).scalar_one_or_none()
+    if not row: raise HTTPException(404,'Jadval topilmadi')
+    await session.delete(row); await session.commit(); return {'ok':True}
 
 @router.get('/reports/monthly')
 async def monthly_report(month:str=Query(default_factory=lambda:date.today().strftime('%Y-%m')),user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
