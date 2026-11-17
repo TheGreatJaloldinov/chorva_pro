@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import String, Integer, Float, Boolean, DateTime, ForeignKey, Text, UniqueConstraint, select
+from sqlalchemy import String, Integer, BigInteger, Float, Boolean, DateTime, ForeignKey, Text, UniqueConstraint, select, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from app.config import DATABASE_URL
@@ -10,7 +10,7 @@ class Base(DeclarativeBase):
 class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    telegram_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     full_name: Mapped[str] = mapped_column(String(200), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -114,6 +114,12 @@ Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Telegram user IDs can exceed PostgreSQL INTEGER (int32). Upgrade
+        # existing installations in-place without deleting user data.
+        if engine.dialect.name == "postgresql":
+            await conn.execute(text(
+                "ALTER TABLE users ALTER COLUMN telegram_id TYPE BIGINT"
+            ))
 
 async def get_user(session: AsyncSession, telegram_id: int, full_name: str = "") -> User:
     result = await session.execute(select(User).where(User.telegram_id == telegram_id))
