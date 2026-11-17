@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import math
 from datetime import datetime, date, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, func
@@ -15,6 +16,61 @@ async def current_user(identity: dict = Depends(telegram_identity), session: Asy
     return await get_user(session, identity["telegram_id"], identity.get("full_name", ""))
 def animal_dict(a):
     return {"id":a.id,"code":a.code,"kind":a.kind,"breed":a.breed,"sex":a.sex,"age_months":a.age_months,"current_weight":a.current_weight,"purchase_date":a.purchase_date,"purchase_price":a.purchase_price,"note":a.note,"status":a.status,"photo_file_id":a.photo_file_id}
+
+
+def _schedule_animal_id(payload: dict) -> int:
+    raw = payload.get("animal_id")
+    if raw is None or str(raw).strip() == "":
+        raise HTTPException(422, "Oziqlantirish jadvali uchun chorvani tanlang")
+    try:
+        aid = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(422, "Chorva tanlovi noto‘g‘ri")
+    if aid <= 0:
+        raise HTTPException(422, "Chorva tanlovi noto‘g‘ri")
+    return aid
+
+
+def _schedule_times(raw_times) -> list[str]:
+    if not isinstance(raw_times, list) or not raw_times:
+        raise HTTPException(422, "Kamida bitta oziqlantirish vaqtini tanlang")
+    normalized = []
+    for raw in raw_times:
+        value = str(raw or "").strip()
+        try:
+            datetime.strptime(value, "%H:%M")
+        except ValueError:
+            raise HTTPException(422, "Oziqlantirish vaqti HH:MM formatida bo‘lishi kerak")
+        if value not in normalized:
+            normalized.append(value)
+    return sorted(normalized)
+
+
+def _schedule_items(raw_items) -> list[dict]:
+    if not isinstance(raw_items, list) or not raw_items:
+        raise HTTPException(422, "Kamida bitta yem tarkibini kiriting")
+    normalized = []
+    for index, item in enumerate(raw_items, start=1):
+        if not isinstance(item, dict):
+            raise HTTPException(422, f"{index}-yem qatori noto‘g‘ri")
+        name = str(item.get("name") or "").strip()
+        raw_qty = item.get("quantity")
+        if raw_qty is None:
+            raw_qty = item.get("qty")
+        if not name:
+            raise HTTPException(422, f"{index}-yem qatorida yem nomini kiriting")
+        if raw_qty is None or str(raw_qty).strip() == "":
+            raise HTTPException(422, f"{name} uchun miqdorni kiriting (masalan, 750 gr yoki 1.3 kg)")
+        try:
+            qty = float(raw_qty)
+        except (TypeError, ValueError):
+            raise HTTPException(422, f"{name} miqdori raqam bo‘lishi kerak")
+        if not math.isfinite(qty) or qty <= 0:
+            raise HTTPException(422, f"{name} miqdori 0 dan katta bo‘lishi kerak")
+        normalized.append({**item, "name": name, "quantity": qty, "qty": qty})
+    if not normalized:
+        raise HTTPException(422, "Kamida bitta to‘liq yem qatorini kiriting")
+    return normalized
 
 @router.get('/health')
 async def health(): return {"ok":True,"app":"CHORVA PRO","version":"2.4.1"}
@@ -234,23 +290,36 @@ async def schedules(user:User=Depends(current_user),session:AsyncSession=Depends
     return [{'id':x.id,'animal_id':x.animal_id,'times':json.loads(x.times_json),'items':json.loads(x.items_json),'active':x.active} for x in rows]
 @router.post('/schedules')
 async def create_schedule(payload:dict,user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
-    aid=int(payload.get('animal_id',0)); a=(await session.execute(select(Animal).where(Animal.id==aid,Animal.user_id==user.id,Animal.status=='active'))).scalar_one_or_none()
-    if not a: raise HTTPException(404,'Faol chorva topilmadi')
-    times=payload.get('times',[]); items=[{**x,'qty':float(x.get('quantity',x.get('qty',0)))} for x in payload.get('items',[])]
-    if not times or not items: raise HTTPException(422,'Vaqt va yem tarkibini kiriting')
-    row=FeedingSchedule(user_id=user.id,animal_id=aid,times_json=json.dumps(times,ensure_ascii=False),items_json=json.dumps(items,ensure_ascii=False),active=True); session.add(row); await session.commit(); return {'ok':True,'id':row.id}
+    aid = _schedule_animal_id(payload)
+    animal = (await session.execute(select(Animal).where(Animal.id==aid,Animal.user_id==user.id,Animal.status=='active'))).scalar_one_or_none()
+    if not animal:
+        raise HTTPException(404,'Faol chorva topilmadi')
+    times = _schedule_times(payload.get('times'))
+    items = _schedule_items(payload.get('items'))
+    row=FeedingSchedule(user_id=user.id,animal_id=aid,times_json=json.dumps(times,ensure_ascii=False),items_json=json.dumps(items,ensure_ascii=False),active=True)
+    session.add(row)
+    await session.commit()
+    return {'ok':True,'id':row.id}
+
 @router.patch('/schedules/{sid}')
 async def update_schedule(sid:int,payload:dict,user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
     row=(await session.execute(select(FeedingSchedule).where(FeedingSchedule.id==sid,FeedingSchedule.user_id==user.id))).scalar_one_or_none()
-    if not row: raise HTTPException(404,'Jadval topilmadi')
-    if 'active' in payload: row.active=bool(payload['active'])
+    if not row:
+        raise HTTPException(404,'Jadval topilmadi')
+    if 'active' in payload:
+        row.active=bool(payload['active'])
     if 'animal_id' in payload:
-        animal=(await session.execute(select(Animal).where(Animal.id==int(payload['animal_id']),Animal.user_id==user.id,Animal.status=='active'))).scalar_one_or_none()
-        if not animal: raise HTTPException(404,'Faol chorva topilmadi')
+        aid = _schedule_animal_id(payload)
+        animal=(await session.execute(select(Animal).where(Animal.id==aid,Animal.user_id==user.id,Animal.status=='active'))).scalar_one_or_none()
+        if not animal:
+            raise HTTPException(404,'Faol chorva topilmadi')
         row.animal_id=animal.id
-    if 'times' in payload: row.times_json=json.dumps(payload['times'],ensure_ascii=False)
-    if 'items' in payload: row.items_json=json.dumps([{**x,'qty':float(x.get('quantity',x.get('qty',0)))} for x in payload['items']],ensure_ascii=False)
-    await session.commit(); return {'ok':True}
+    if 'times' in payload:
+        row.times_json=json.dumps(_schedule_times(payload['times']),ensure_ascii=False)
+    if 'items' in payload:
+        row.items_json=json.dumps(_schedule_items(payload['items']),ensure_ascii=False)
+    await session.commit()
+    return {'ok':True}
 
 @router.delete('/schedules/{sid}')
 async def delete_schedule(sid:int,user:User=Depends(current_user),session:AsyncSession=Depends(db_session)):
